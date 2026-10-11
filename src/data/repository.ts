@@ -1,5 +1,6 @@
 import {
   AppSettings,
+  AuthorizedIpDevice,
   DEFAULT_CATEGORIES,
   DEFAULT_FRIENDS,
   DEFAULT_SETTINGS,
@@ -17,6 +18,12 @@ import {
 } from '@/domain/models';
 import { roundTND } from '@/domain/formatTND';
 import { cycleManualOverride } from '@/domain/influenceEngine';
+import {
+  ipToDocumentId,
+  normalizeIpAddress,
+  parseDeviceFromUserAgent,
+  verifySecurityPassword,
+} from '@/domain/securityEngine';
 import { buildInitialSeedTransactions, db, KanawitaDB } from './db';
 
 type SyncTriggerCallback = () => void;
@@ -540,6 +547,7 @@ export interface KanawitaBackupBundle {
   friends: Friend[];
   transactions: Transaction[];
   settings: AppSettings;
+  authorizedIps?: AuthorizedIpDevice[];
 }
 
 /**
@@ -548,13 +556,14 @@ export interface KanawitaBackupBundle {
 export const exportFullBackupJson = async (
   targetDb: KanawitaDB = db
 ): Promise<string> => {
-  const [vaults, categories, friends, transactions, settingsDoc] =
+  const [vaults, categories, friends, transactions, settingsDoc, authorizedIps] =
     await Promise.all([
       targetDb.vaults.toArray(),
       targetDb.categories.toArray(),
       targetDb.friends.toArray(),
       targetDb.transactions.toArray(),
       targetDb.settings.get('app_settings'),
+      targetDb.authorizedIps.toArray(),
     ]);
 
   const bundle: KanawitaBackupBundle = {
@@ -565,6 +574,7 @@ export const exportFullBackupJson = async (
     friends,
     transactions,
     settings: settingsDoc ?? DEFAULT_SETTINGS,
+    authorizedIps,
   };
 
   return JSON.stringify(bundle, null, 2);
@@ -633,13 +643,20 @@ export const importFullBackupJson = async (
       targetDb.friends,
       targetDb.transactions,
       targetDb.settings,
+      targetDb.authorizedIps,
       targetDb.syncOutbox,
     ],
     async () => {
-      const [existingFriends, existingTxs] = await Promise.all([
-        targetDb.friends.toArray(),
-        targetDb.transactions.toArray(),
-      ]);
+      const [existingFriends, existingTxs, existingAuthorizedIps, existingIpOutbox] =
+        await Promise.all([
+          targetDb.friends.toArray(),
+          targetDb.transactions.toArray(),
+          targetDb.authorizedIps.toArray(),
+          targetDb.syncOutbox
+            .where('collection')
+            .equals('authorizedIps')
+            .toArray(),
+        ]);
 
       // Clear any stale pre-import outbox items so replaced local mutations aren't flushed
       await targetDb.syncOutbox.clear();
@@ -698,6 +715,36 @@ export const importFullBackupJson = async (
         );
       }
 
+      if (Array.isArray(parsed.authorizedIps)) {
+        const importedIpIds = new Set(parsed.authorizedIps.map((ip) => ip.id));
+        for (const oldIpDoc of existingAuthorizedIps) {
+          if (!importedIpIds.has(oldIpDoc.id)) {
+            await enqueueOutboxItem(
+              targetDb,
+              'authorizedIps',
+              oldIpDoc.id,
+              'delete',
+              { id: oldIpDoc.id, ip: oldIpDoc.ip, deletedAt: now },
+              now
+            );
+          }
+        }
+        await targetDb.authorizedIps.clear();
+        await targetDb.authorizedIps.bulkPut(parsed.authorizedIps);
+        for (const ipDoc of parsed.authorizedIps) {
+          await enqueueOutboxItem(
+            targetDb,
+            'authorizedIps',
+            ipDoc.id,
+            'upsert',
+            ipDoc,
+            now
+          );
+        }
+      } else if (existingIpOutbox.length > 0) {
+        await targetDb.syncOutbox.bulkPut(existingIpOutbox);
+      }
+
       if (parsed.settings) {
         const currentSettings =
           (await targetDb.settings.get('app_settings')) ?? DEFAULT_SETTINGS;
@@ -728,6 +775,226 @@ export const importFullBackupJson = async (
     importedTransactions: txsToImport.length,
     importedFriends: friendsToImport.length,
   };
+};
+
+export interface AuthorizeIpInput {
+  password: string;
+  ip: string;
+  userAgent?: string;
+  locationHint?: string;
+  isInitialSignup?: boolean;
+}
+
+/**
+ * Verifies the security password (`61854`) and registers the IP + device in `db.authorizedIps`
+ * and queues all recognized IPs (old IPs + new IP) into `db.syncOutbox` for MongoDB Atlas storage.
+ */
+export const authorizeIpWithPassword = async (
+  input: AuthorizeIpInput,
+  targetDb: KanawitaDB = db
+): Promise<AuthorizedIpDevice> => {
+  if (!verifySecurityPassword(input.password)) {
+    throw new Error('Invalid security password');
+  }
+
+  const normalizedIp = normalizeIpAddress(input.ip);
+  const docId = ipToDocumentId(normalizedIp);
+  const parsedDevice = parseDeviceFromUserAgent(input.userAgent);
+  const now = Date.now();
+  let authorizedRecord!: AuthorizedIpDevice;
+
+  await targetDb.transaction(
+    'rw',
+    [targetDb.authorizedIps, targetDb.syncOutbox],
+    async () => {
+      const existing = await targetDb.authorizedIps.get(docId);
+      const allExisting = await targetDb.authorizedIps.toArray();
+      const hasInitialSignup = allExisting.some((item) => item.isInitialSignup);
+
+      authorizedRecord = {
+        id: docId,
+        ip: normalizedIp,
+        deviceName: parsedDevice.deviceName,
+        os: parsedDevice.os,
+        browser: parsedDevice.browser,
+        deviceType: parsedDevice.deviceType,
+        userAgent: input.userAgent || existing?.userAgent || '',
+        locationHint:
+          input.locationHint ??
+          existing?.locationHint ??
+          (normalizedIp === '127.0.0.1'
+            ? 'Localhost • Direct Device'
+            : 'Verified IP Session'),
+        isInitialSignup:
+          existing?.isInitialSignup ??
+          input.isInitialSignup ??
+          !hasInitialSignup,
+        recognized: true,
+        createdAt: existing?.createdAt ?? now,
+        lastSeenAt: now,
+        signInCount: (existing?.signInCount ?? 0) + 1,
+        updatedAt: now,
+      };
+
+      await targetDb.authorizedIps.put(authorizedRecord);
+
+      // Register both existing old IPs and the newly authorized IP in MongoDB outbox
+      for (const oldIpDoc of allExisting) {
+        if (oldIpDoc.id !== docId) {
+          await enqueueOutboxItem(
+            targetDb,
+            'authorizedIps',
+            oldIpDoc.id,
+            'upsert',
+            oldIpDoc,
+            oldIpDoc.updatedAt || now
+          );
+        }
+      }
+
+      await enqueueOutboxItem(
+        targetDb,
+        'authorizedIps',
+        authorizedRecord.id,
+        'upsert',
+        authorizedRecord,
+        now
+      );
+    }
+  );
+
+  notifySyncTrigger();
+  return authorizedRecord;
+};
+
+/**
+ * Updates `lastSeenAt` for an already-recognized IP address without requiring a password,
+ * while preserving the device metadata recorded when that IP signed up.
+ */
+export const touchAuthorizedIpSession = async (
+  ip: string,
+  userAgent?: string,
+  targetDb: KanawitaDB = db
+): Promise<AuthorizedIpDevice | null> => {
+  const normalizedIp = normalizeIpAddress(ip);
+  const docId = ipToDocumentId(normalizedIp);
+  const now = Date.now();
+  let updated: AuthorizedIpDevice | null = null;
+
+  await targetDb.transaction(
+    'rw',
+    [targetDb.authorizedIps, targetDb.syncOutbox],
+    async () => {
+      const existing = await targetDb.authorizedIps.get(docId);
+      if (!existing || !existing.recognized) return;
+
+      const parsed = userAgent ? parseDeviceFromUserAgent(userAgent) : null;
+      updated = {
+        ...existing,
+        deviceName: existing.deviceName || parsed?.deviceName || 'Desktop • Browser',
+        os: existing.os || parsed?.os || 'Desktop OS',
+        browser: existing.browser || parsed?.browser || 'Browser',
+        deviceType: existing.deviceType || parsed?.deviceType || 'desktop',
+        userAgent: existing.userAgent || userAgent || '',
+        lastSeenAt: now,
+        updatedAt: now,
+      };
+
+      await targetDb.authorizedIps.put(updated);
+      await enqueueOutboxItem(
+        targetDb,
+        'authorizedIps',
+        updated.id,
+        'upsert',
+        updated,
+        now
+      );
+    }
+  );
+
+  if (updated) notifySyncTrigger();
+  return updated;
+};
+
+/**
+ * Deletes/revokes an IP from `db.authorizedIps` and queues a `delete` operation for MongoDB Atlas,
+ * preventing any user on that IP from accessing the app without re-entering the password.
+ */
+export const revokeAuthorizedIp = async (
+  ipOrId: string,
+  targetDb: KanawitaDB = db
+): Promise<string | null> => {
+  const now = Date.now();
+  let revokedIp: string | null = null;
+
+  await targetDb.transaction(
+    'rw',
+    [targetDb.authorizedIps, targetDb.syncOutbox],
+    async () => {
+      const directById = await targetDb.authorizedIps.get(ipOrId);
+      const normalizedIp = normalizeIpAddress(ipOrId);
+      const derivedId = ipToDocumentId(normalizedIp);
+      const target =
+        directById ??
+        (await targetDb.authorizedIps.get(derivedId)) ??
+        (await targetDb.authorizedIps
+          .filter((d) => normalizeIpAddress(d.ip) === normalizedIp)
+          .first());
+
+      const deleteId = target?.id ?? derivedId;
+      revokedIp = target?.ip ?? normalizedIp;
+
+      await targetDb.authorizedIps.delete(deleteId);
+      await enqueueOutboxItem(
+        targetDb,
+        'authorizedIps',
+        deleteId,
+        'delete',
+        { id: deleteId, ip: revokedIp, deletedAt: now },
+        now
+      );
+    }
+  );
+
+  notifySyncTrigger();
+  return revokedIp;
+};
+
+/**
+ * Enqueues all locally recognized IPs into `syncOutbox` so historical/old IPs are registered in MongoDB.
+ */
+export const queueAllAuthorizedIpsForSync = async (
+  targetDb: KanawitaDB = db
+): Promise<number> => {
+  const now = Date.now();
+  let count = 0;
+
+  await targetDb.transaction(
+    'rw',
+    [targetDb.authorizedIps, targetDb.syncOutbox],
+    async () => {
+      const all = await targetDb.authorizedIps.toArray();
+      count = all.length;
+      for (const item of all) {
+        const existingOutbox = await targetDb.syncOutbox.get(
+          `authorizedIps:${item.id}`
+        );
+        if (!existingOutbox) {
+          await enqueueOutboxItem(
+            targetDb,
+            'authorizedIps',
+            item.id,
+            'upsert',
+            item,
+            item.updatedAt || now
+          );
+        }
+      }
+    }
+  );
+
+  if (count > 0) notifySyncTrigger();
+  return count;
 };
 
 /**
@@ -783,15 +1050,25 @@ export const reloadDemoDataset = async (
       targetDb.syncOutbox,
     ],
     async () => {
-      const [existingFriends, existingTxs, currentSettings] = await Promise.all(
-        [
-          targetDb.friends.toArray(),
-          targetDb.transactions.toArray(),
-          targetDb.settings.get('app_settings'),
-        ]
-      );
+      const [
+        existingFriends,
+        existingTxs,
+        currentSettings,
+        existingIpOutbox,
+      ] = await Promise.all([
+        targetDb.friends.toArray(),
+        targetDb.transactions.toArray(),
+        targetDb.settings.get('app_settings'),
+        targetDb.syncOutbox
+          .where('collection')
+          .equals('authorizedIps')
+          .toArray(),
+      ]);
 
       await targetDb.syncOutbox.clear();
+      if (existingIpOutbox.length > 0) {
+        await targetDb.syncOutbox.bulkPut(existingIpOutbox);
+      }
 
       for (const oldFriend of existingFriends) {
         if (!demoFriendIds.has(oldFriend.id)) {

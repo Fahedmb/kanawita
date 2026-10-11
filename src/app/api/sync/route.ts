@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { MongoClient, type Db } from 'mongodb';
 import type { SyncCollectionName, SyncOutboxItem } from '@/domain/models';
+import { getMongoDatabase, isValidMongoUri } from '@/data/mongoServer';
 
 const ALLOWED_COLLECTIONS: SyncCollectionName[] = [
   'vaults',
@@ -8,52 +8,8 @@ const ALLOWED_COLLECTIONS: SyncCollectionName[] = [
   'friends',
   'transactions',
   'settings',
+  'authorizedIps',
 ];
-
-interface CachedConnection {
-  uri: string;
-  dbName: string;
-  client: MongoClient;
-  db: Db;
-}
-
-declare global {
-  // eslint-disable-next-line no-var
-  var __kanawitaMongoCache: CachedConnection | undefined;
-}
-
-const isValidMongoUri = (uri: string): boolean => {
-  const trimmed = uri.trim();
-  return (
-    trimmed.startsWith('mongodb://') || trimmed.startsWith('mongodb+srv://')
-  );
-};
-
-const getMongoDatabase = async (
-  uri: string,
-  dbName: string
-): Promise<Db> => {
-  const cached = global.__kanawitaMongoCache;
-  if (cached && cached.uri === uri && cached.dbName === dbName) {
-    return cached.db;
-  }
-
-  const client = new MongoClient(uri, {
-    serverSelectionTimeoutMS: 5000,
-    connectTimeoutMS: 5000,
-  });
-  await client.connect();
-  const db = client.db(dbName);
-
-  global.__kanawitaMongoCache = {
-    uri,
-    dbName,
-    client,
-    db,
-  };
-
-  return db;
-};
 
 /**
  * GET /api/sync
@@ -171,36 +127,71 @@ export async function POST(request: NextRequest) {
         await col.bulkWrite(ops, { ordered: false });
         flushedCount += ops.length;
       }
+
+      if (collectionName === 'authorizedIps') {
+        const revokedCol = db.collection<Record<string, unknown>>('revokedIps');
+        const revokedOps = items.map((item: SyncOutboxItem) => {
+          if (item.action === 'delete') {
+            global.__kanawitaSecurityState?.authorizedMap.delete(item.documentId);
+            global.__kanawitaSecurityState?.revokedIds.add(item.documentId);
+            return {
+              updateOne: {
+                filter: { id: item.documentId },
+                update: {
+                  $set: { id: item.documentId, revokedAt: Date.now() },
+                },
+                upsert: true,
+              },
+            };
+          }
+          global.__kanawitaSecurityState?.revokedIds.delete(item.documentId);
+          return {
+            deleteOne: {
+              filter: { id: item.documentId },
+            },
+          };
+        });
+        if (revokedOps.length > 0) {
+          await revokedCol.bulkWrite(revokedOps, { ordered: false });
+        }
+      }
     }
 
     let remoteData: Record<string, unknown[]> | undefined;
     if (body.pullCollections !== false) {
-      const [vaults, categories, friends, transactions] = await Promise.all([
-        db
-          .collection('vaults')
-          .find({}, { projection: { _id: 0 } })
-          .toArray(),
-        db
-          .collection('categories')
-          .find({}, { projection: { _id: 0 } })
-          .toArray(),
-        db
-          .collection('friends')
-          .find({}, { projection: { _id: 0 } })
-          .toArray(),
-        db
-          .collection('transactions')
-          .find({}, { projection: { _id: 0 } })
-          .sort({ timestamp: -1 })
-          .limit(2000)
-          .toArray(),
-      ]);
+      const [vaults, categories, friends, transactions, authorizedIps] =
+        await Promise.all([
+          db
+            .collection('vaults')
+            .find({}, { projection: { _id: 0 } })
+            .toArray(),
+          db
+            .collection('categories')
+            .find({}, { projection: { _id: 0 } })
+            .toArray(),
+          db
+            .collection('friends')
+            .find({}, { projection: { _id: 0 } })
+            .toArray(),
+          db
+            .collection('transactions')
+            .find({}, { projection: { _id: 0 } })
+            .sort({ timestamp: -1 })
+            .limit(2000)
+            .toArray(),
+          db
+            .collection('authorizedIps')
+            .find({}, { projection: { _id: 0 } })
+            .sort({ lastSeenAt: -1 })
+            .toArray(),
+        ]);
 
       remoteData = {
         vaults,
         categories,
         friends,
         transactions,
+        authorizedIps,
       };
     }
 

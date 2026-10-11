@@ -16,6 +16,16 @@ import {
 } from './influenceEngine';
 import { computeDashboardMetrics } from './metricsEngine';
 import {
+  appendSecurityPinKey,
+  backspaceSecurityPin,
+  ipToDocumentId,
+  isIpAuthorized,
+  normalizeIpAddress,
+  parseDeviceFromUserAgent,
+  verifySecurityPassword,
+} from './securityEngine';
+import {
+  DEFAULT_AUTHORIZED_IPS,
   DEFAULT_CATEGORIES,
   DEFAULT_FRIENDS,
   DEFAULT_VAULTS,
@@ -317,3 +327,80 @@ describe('High-Signal Metrics Dashboard Engine & Monthly Fixed Bills Filter', ()
     expect(report.heatmap28Days[25].dateKey).toBe('2026-03-28');
   });
 });
+
+describe('Security Engine (Password 61854, IP Normalization & Device Detection)', () => {
+  it('validates the exact security password 61854 and rejects wrong or empty inputs', () => {
+    expect(verifySecurityPassword('61854')).toBe(true);
+    expect(verifySecurityPassword('  61854  ')).toBe(true);
+    expect(verifySecurityPassword('61853')).toBe(false);
+    expect(verifySecurityPassword('00000')).toBe(false);
+    expect(verifySecurityPassword('')).toBe(false);
+    expect(verifySecurityPassword(null)).toBe(false);
+    expect(verifySecurityPassword(undefined)).toBe(false);
+  });
+
+  it('normalizes IPv4, IPv6 localhost, bracketed IPv6, IPv4-mapped IPv6, ip_ document IDs, and x-forwarded-for chains', () => {
+    expect(normalizeIpAddress('::1')).toBe('127.0.0.1');
+    expect(normalizeIpAddress('[::1]:3000')).toBe('127.0.0.1');
+    expect(normalizeIpAddress('127.0.0.1:3000')).toBe('127.0.0.1');
+    expect(normalizeIpAddress('::ffff:127.0.0.1')).toBe('127.0.0.1');
+    expect(normalizeIpAddress('::ffff:197.26.18.42')).toBe('197.26.18.42');
+    expect(normalizeIpAddress('[2001:DB8::1]:8080')).toBe('2001:db8::1');
+    expect(normalizeIpAddress('2001:DB8::1')).toBe('2001:db8::1');
+    expect(normalizeIpAddress('197.26.18.42, 10.0.0.1')).toBe('197.26.18.42');
+    expect(normalizeIpAddress('41.226.45.110:51234')).toBe('41.226.45.110');
+    expect(normalizeIpAddress('ip_197_26_18_42')).toBe('197.26.18.42');
+    expect(normalizeIpAddress('')).toBe('127.0.0.1');
+    expect(normalizeIpAddress(null)).toBe('127.0.0.1');
+    expect(ipToDocumentId('197.26.18.42')).toBe('ip_197_26_18_42');
+    expect(ipToDocumentId('ip_197_26_18_42')).toBe('ip_197_26_18_42');
+    expect(ipToDocumentId('2001:DB8::1')).toBe(ipToDocumentId('2001:db8::1'));
+  });
+
+  it('checks whether an IP is recognized and detects unrecognized new IPs', () => {
+    expect(isIpAuthorized('197.26.18.42', DEFAULT_AUTHORIZED_IPS)).toBe(true);
+    expect(isIpAuthorized('::ffff:41.226.45.110', DEFAULT_AUTHORIZED_IPS)).toBe(
+      true
+    );
+    expect(isIpAuthorized('127.0.0.1', DEFAULT_AUTHORIZED_IPS)).toBe(false);
+    expect(isIpAuthorized('102.159.44.12', DEFAULT_AUTHORIZED_IPS)).toBe(false);
+    expect(isIpAuthorized('', DEFAULT_AUTHORIZED_IPS)).toBe(false);
+  });
+
+  it('parses User-Agent strings into device model, OS, browser, and deviceType', () => {
+    const iphone = parseDeviceFromUserAgent(
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Version/17.4 Mobile/15E148 Safari/604.1'
+    );
+    expect(iphone.deviceType).toBe('mobile');
+    expect(iphone.os).toBe('iOS');
+    expect(iphone.browser).toBe('Mobile Safari');
+    expect(iphone.deviceName).toBe('iPhone • Mobile Safari');
+
+    const winEdge = parseDeviceFromUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0'
+    );
+    expect(winEdge.deviceType).toBe('desktop');
+    expect(winEdge.os).toBe('Windows');
+    expect(winEdge.browser).toBe('Edge');
+    expect(winEdge.deviceName).toBe('Windows PC • Edge');
+
+    const ipad = parseDeviceFromUserAgent(
+      'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1'
+    );
+    expect(ipad.deviceType).toBe('tablet');
+    expect(ipad.os).toBe('iPadOS');
+  });
+
+  it('handles security PIN keypad digit append and backspace cleanly', () => {
+    let pin = '';
+    for (const d of ['6', '1', '8', '5', '4']) {
+      pin = appendSecurityPinKey(pin, d);
+    }
+    expect(pin).toBe('61854');
+    expect(appendSecurityPinKey(pin, 'x')).toBe('61854');
+    expect(backspaceSecurityPin(pin)).toBe('6185');
+    expect(backspaceSecurityPin('6')).toBe('');
+    expect(backspaceSecurityPin('')).toBe('');
+  });
+});
+

@@ -17,6 +17,7 @@ import {
   clearAllTransactions,
   exportFullBackupJson,
   importFullBackupJson,
+  queueAllAuthorizedIpsForSync,
   reloadDemoDataset,
   updateAppSettings,
 } from '@/data/repository';
@@ -55,6 +56,7 @@ export const SettingsSyncView: React.FC<SettingsSyncViewProps> = ({
 
     if (mongoUri.trim()) {
       setIsSyncingManual(true);
+      await queueAllAuthorizedIpsForSync();
       const res = await syncNow({ forcePull: true });
       setIsSyncingManual(false);
       onToast(res.message);
@@ -65,6 +67,7 @@ export const SettingsSyncView: React.FC<SettingsSyncViewProps> = ({
 
   const handleManualSyncNow = async () => {
     setIsSyncingManual(true);
+    await queueAllAuthorizedIpsForSync();
     const res = await syncNow({ forcePull: true });
     setIsSyncingManual(false);
     onToast(res.message);

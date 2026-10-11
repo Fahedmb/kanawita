@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ensureDatabaseSeeded, KanawitaDB } from './db';
 import {
   addFriend,
+  authorizeIpWithPassword,
   clearAllSpendingOffsets,
   cycleFriendInfluenceOverride,
   exportFullBackupJson,
@@ -11,12 +12,15 @@ import {
   reloadDemoDataset,
   removeFriend,
   restoreTransaction,
+  revokeAuthorizedIp,
   softDeleteTransaction,
+  touchAuthorizedIpSession,
   updateAppSettings,
   updateVaultBalance,
 } from './repository';
 import { mergeRemoteDataIntoLocal, syncNow } from './syncEngine';
 import { computeUnifiedBalance } from '@/domain/balanceEngine';
+import { isIpAuthorized } from '@/domain/securityEngine';
 
 describe('Kanawita Local IndexedDB Repository & Outbox Queue', () => {
   let testDb: KanawitaDB;
@@ -267,4 +271,118 @@ describe('Kanawita Local IndexedDB Repository & Outbox Queue', () => {
     const updatedSavings = await testDb.vaults.get('savings');
     expect(updatedSavings?.balance).toBe(3900);
   });
+
+  it('enforces password 61854 for new IPs, queues old & new IPs in syncOutbox for MongoDB, and revokes access when an IP is deleted', async () => {
+    const initialIps = await testDb.authorizedIps.toArray();
+    expect(initialIps.length).toBeGreaterThanOrEqual(2);
+    expect(isIpAuthorized('197.26.18.42', initialIps)).toBe(true);
+    expect(isIpAuthorized('102.159.44.12', initialIps)).toBe(false);
+
+    // Wrong password must be rejected
+    await expect(
+      authorizeIpWithPassword(
+        {
+          password: '99999',
+          ip: '102.159.44.12',
+          userAgent:
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0',
+        },
+        testDb
+      )
+    ).rejects.toThrow('Invalid security password');
+
+    // Correct password 61854 authorizes the new IP and queues both old IPs and the new IP in syncOutbox
+    const record = await authorizeIpWithPassword(
+      {
+        password: '61854',
+        ip: '102.159.44.12',
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0',
+      },
+      testDb
+    );
+    expect(record.ip).toBe('102.159.44.12');
+    expect(record.deviceName).toBe('Windows PC • Chrome');
+    expect(record.recognized).toBe(true);
+
+    const afterAuthIps = await testDb.authorizedIps.toArray();
+    expect(isIpAuthorized('102.159.44.12', afterAuthIps)).toBe(true);
+
+    // Verify both the new IP and old IPs were queued in syncOutbox for MongoDB registration
+    const newOutbox = await testDb.syncOutbox.get(
+      'authorizedIps:ip_102_159_44_12'
+    );
+    const oldOutbox = await testDb.syncOutbox.get(
+      'authorizedIps:ip_197_26_18_42'
+    );
+    expect(newOutbox?.action).toBe('upsert');
+    expect(oldOutbox?.action).toBe('upsert');
+
+    // Touching an already-recognized IP updates lastSeenAt without clobbering historical signup device metadata
+    const touchedSignup = await touchAuthorizedIpSession(
+      '197.26.18.42',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0',
+      testDb
+    );
+    expect(touchedSignup?.ip).toBe('197.26.18.42');
+    expect(touchedSignup?.deviceName).toBe('iPhone 15 • Mobile Safari');
+    expect(touchedSignup?.os).toBe('iOS');
+
+    // Deleting an IP removes it from recognized IPs and queues a delete in syncOutbox
+    await revokeAuthorizedIp('102.159.44.12', testDb);
+    const afterRevokeIps = await testDb.authorizedIps.toArray();
+    expect(isIpAuthorized('102.159.44.12', afterRevokeIps)).toBe(false);
+
+    const deleteOutbox = await testDb.syncOutbox.get(
+      'authorizedIps:ip_102_159_44_12'
+    );
+    expect(deleteOutbox?.action).toBe('delete');
+
+    // Reloading demo dataset preserves pending authorizedIps outbox mutations
+    await reloadDemoDataset(testDb);
+    const preservedDeleteOutbox = await testDb.syncOutbox.get(
+      'authorizedIps:ip_102_159_44_12'
+    );
+    expect(preservedDeleteOutbox?.action).toBe('delete');
+
+    // If remote MongoDB returns only one remaining authorized IP and local outbox is empty, revoked IPs are removed locally too
+    await testDb.syncOutbox.clear();
+    await mergeRemoteDataIntoLocal(
+      {
+        authorizedIps: [
+          {
+            id: 'ip_197_26_18_42',
+            ip: '197.26.18.42',
+            deviceName: 'iPhone 15 • Mobile Safari',
+            os: 'iOS',
+            browser: 'Safari',
+            deviceType: 'mobile',
+            userAgent: 'Mozilla/5.0 (iPhone)',
+            isInitialSignup: true,
+            recognized: true,
+            createdAt: 1729500000000,
+            lastSeenAt: 1730000000000,
+            signInCount: 15,
+            updatedAt: Date.now() + 20_000,
+          },
+        ],
+      },
+      testDb
+    );
+    const syncedIps = await testDb.authorizedIps.toArray();
+    expect(syncedIps).toHaveLength(1);
+    expect(isIpAuthorized('41.226.45.110', syncedIps)).toBe(false);
+    expect(isIpAuthorized('197.26.18.42', syncedIps)).toBe(true);
+
+    // When authoritativeAuthorizedIps is true (or lastSyncedAt is set) and all IPs are deleted remotely (authorizedIps: []), the last local IP is also removed
+    await testDb.syncOutbox.clear();
+    await mergeRemoteDataIntoLocal(
+      { authorizedIps: [] },
+      testDb,
+      { authoritativeAuthorizedIps: true }
+    );
+    expect(await testDb.authorizedIps.count()).toBe(0);
+  });
 });
+
+

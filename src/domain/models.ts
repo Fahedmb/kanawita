@@ -49,12 +49,34 @@ export interface Transaction {
   deletedAt?: number | null;
 }
 
+export const KANAWITA_SECURITY_PASSWORD = '61854';
+
+export type DeviceKind = 'mobile' | 'tablet' | 'desktop';
+
+export interface AuthorizedIpDevice {
+  id: string;                 // Deterministic ID, e.g. "ip_197_26_18_42"
+  ip: string;                 // Normalized IP address, e.g. "197.26.18.42"
+  deviceName: string;         // e.g. "iPhone 15 • Mobile Safari"
+  os: string;                 // e.g. "iOS", "Windows", "Android", "macOS"
+  browser: string;            // e.g. "Safari", "Chrome", "Firefox", "Edge"
+  deviceType: DeviceKind;     // 'mobile' | 'tablet' | 'desktop'
+  userAgent: string;          // Raw User-Agent string
+  locationHint?: string;      // Optional network/location description
+  isInitialSignup: boolean;   // True if this device was used for initial signup
+  recognized: boolean;        // True when authorized/recognized
+  createdAt: number;          // First authorized timestamp
+  lastSeenAt: number;         // Most recent access timestamp
+  signInCount: number;        // Number of verified sign-ins from this IP
+  updatedAt: number;          // LWW sync timestamp
+}
+
 export type SyncCollectionName =
   | 'vaults'
   | 'categories'
   | 'friends'
   | 'transactions'
-  | 'settings';
+  | 'settings'
+  | 'authorizedIps';
 
 export interface SyncOutboxItem {
   id: string;
@@ -74,6 +96,7 @@ export interface AppSettings {
   eveningReminderTime: string; // "21:00"
   lastSyncedAt: number | null;
   lastVaultResetAt: number | null;
+  securitySeeded?: boolean;
   updatedAt: number;
 }
 
@@ -259,5 +282,44 @@ export const DEFAULT_SETTINGS: AppSettings = {
   eveningReminderTime: '21:00',
   lastSyncedAt: null,
   lastVaultResetAt: null,
+  securitySeeded: true,
   updatedAt: 1730000000000,
 };
+
+export const DEFAULT_AUTHORIZED_IPS: AuthorizedIpDevice[] = [
+  {
+    id: 'ip_197_26_18_42',
+    ip: '197.26.18.42',
+    deviceName: 'iPhone 15 • Mobile Safari',
+    os: 'iOS',
+    browser: 'Safari',
+    deviceType: 'mobile',
+    userAgent:
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+    locationHint: 'Tunis • Tunisie Telecom 5G',
+    isInitialSignup: true,
+    recognized: true,
+    createdAt: 1729500000000,
+    lastSeenAt: 1730000000000,
+    signInCount: 14,
+    updatedAt: 1730000000000,
+  },
+  {
+    id: 'ip_41_226_45_110',
+    ip: '41.226.45.110',
+    deviceName: 'MacBook Pro • Chrome',
+    os: 'macOS',
+    browser: 'Chrome',
+    deviceType: 'desktop',
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    locationHint: 'La Marsa • Topnet Fiber',
+    isInitialSignup: false,
+    recognized: true,
+    createdAt: 1729800000000,
+    lastSeenAt: 1730050000000,
+    signInCount: 6,
+    updatedAt: 1730050000000,
+  },
+];
+

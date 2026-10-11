@@ -1,6 +1,8 @@
 import Dexie, { type Table } from 'dexie';
 import {
   AppSettings,
+  AuthorizedIpDevice,
+  DEFAULT_AUTHORIZED_IPS,
   DEFAULT_CATEGORIES,
   DEFAULT_FRIENDS,
   DEFAULT_SETTINGS,
@@ -20,6 +22,7 @@ export class KanawitaDB extends Dexie {
   transactions!: Table<Transaction, string>;
   syncOutbox!: Table<SyncOutboxItem, string>;
   settings!: Table<AppSettings, string>;
+  authorizedIps!: Table<AuthorizedIpDevice, string>;
 
   constructor(dbName = 'KanawitaLocalDB') {
     super(dbName);
@@ -31,6 +34,17 @@ export class KanawitaDB extends Dexie {
         'id, type, categoryId, vaultId, timestamp, updatedAt, countInBalanceOffset',
       syncOutbox: 'id, collection, documentId, timestamp',
       settings: 'id, updatedAt',
+      authorizedIps: 'id, ip, recognized, lastSeenAt, updatedAt',
+    });
+    this.version(2).stores({
+      vaults: 'id, updatedAt',
+      categories: 'id, kind, sortOrder',
+      friends: 'id, name, updatedAt',
+      transactions:
+        'id, type, categoryId, vaultId, timestamp, updatedAt, countInBalanceOffset',
+      syncOutbox: 'id, collection, documentId, timestamp',
+      settings: 'id, updatedAt',
+      authorizedIps: 'id, ip, recognized, lastSeenAt, updatedAt',
     });
   }
 }
@@ -244,6 +258,7 @@ export const ensureDatabaseSeeded = async (
         targetDb.friends,
         targetDb.transactions,
         targetDb.settings,
+        targetDb.authorizedIps,
       ],
       async () => {
         const vaultCount = await targetDb.vaults.count();
@@ -269,9 +284,10 @@ export const ensureDatabaseSeeded = async (
         if (!settingsDoc) {
           await targetDb.settings.put({
             ...DEFAULT_SETTINGS,
+            securitySeeded: true,
             updatedAt: Date.now(),
           });
-          // First-time initialization: seed friends and realistic starter spendings
+          // First-time initialization: seed friends, realistic starter spendings, and historical signup IPs
           const friendCount = await targetDb.friends.count();
           if (friendCount === 0) {
             await targetDb.friends.bulkPut(DEFAULT_FRIENDS);
@@ -280,6 +296,19 @@ export const ensureDatabaseSeeded = async (
           if (txCount === 0) {
             await targetDb.transactions.bulkPut(buildInitialSeedTransactions());
           }
+          const ipCount = await targetDb.authorizedIps.count();
+          if (ipCount === 0) {
+            await targetDb.authorizedIps.bulkPut(DEFAULT_AUTHORIZED_IPS);
+          }
+        } else if (!settingsDoc.securitySeeded) {
+          const ipCount = await targetDb.authorizedIps.count();
+          if (ipCount === 0) {
+            await targetDb.authorizedIps.bulkPut(DEFAULT_AUTHORIZED_IPS);
+          }
+          await targetDb.settings.put({
+            ...settingsDoc,
+            securitySeeded: true,
+          });
         }
       }
     );

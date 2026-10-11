@@ -1,7 +1,9 @@
 import {
   AppSettings,
+  AuthorizedIpDevice,
   Friend,
   SpendingCategory,
+  SyncOutboxItem,
   SyncRuntimeStatus,
   Transaction,
   VaultAccount,
@@ -49,6 +51,7 @@ export interface SyncApiPullPayload {
   friends?: Friend[];
   transactions?: Transaction[];
   settings?: AppSettings[];
+  authorizedIps?: AuthorizedIpDevice[];
 }
 
 interface SyncApiResponse {
@@ -67,7 +70,8 @@ interface SyncApiResponse {
  */
 export const mergeRemoteDataIntoLocal = async (
   remote: SyncApiPullPayload,
-  targetDb: KanawitaDB = db
+  targetDb: KanawitaDB = db,
+  options?: { authoritativeAuthorizedIps?: boolean }
 ): Promise<void> => {
   await targetDb.transaction(
     'rw',
@@ -76,6 +80,8 @@ export const mergeRemoteDataIntoLocal = async (
       targetDb.categories,
       targetDb.friends,
       targetDb.transactions,
+      targetDb.authorizedIps,
+      targetDb.settings,
       targetDb.syncOutbox,
     ],
     async () => {
@@ -123,6 +129,40 @@ export const mergeRemoteDataIntoLocal = async (
           const local = await targetDb.transactions.get(rTx.id);
           if (!local || (rTx.updatedAt ?? 0) > (local.updatedAt ?? 0)) {
             await targetDb.transactions.put(rTx);
+          }
+        }
+      }
+
+      if (Array.isArray(remote.authorizedIps)) {
+        for (const rIp of remote.authorizedIps) {
+          const pending = await targetDb.syncOutbox.get(
+            `authorizedIps:${rIp.id}`
+          );
+          if (pending) continue;
+          const local = await targetDb.authorizedIps.get(rIp.id);
+          if (!local || (rIp.updatedAt ?? 0) > (local.updatedAt ?? 0)) {
+            await targetDb.authorizedIps.put(rIp);
+          }
+        }
+
+        // Remove any local IPs that were revoked remotely in MongoDB or /api/security (unless pending in local outbox)
+        const settingsDoc = await targetDb.settings.get('app_settings');
+        if (
+          options?.authoritativeAuthorizedIps ||
+          remote.authorizedIps.length > 0 ||
+          Boolean(settingsDoc?.lastSyncedAt)
+        ) {
+          const remoteIds = new Set(remote.authorizedIps.map((r) => r.id));
+          const localIps = await targetDb.authorizedIps.toArray();
+          for (const localIp of localIps) {
+            if (!remoteIds.has(localIp.id)) {
+              const pending = await targetDb.syncOutbox.get(
+                `authorizedIps:${localIp.id}`
+              );
+              if (!pending) {
+                await targetDb.authorizedIps.delete(localIp.id);
+              }
+            }
           }
         }
       }
@@ -190,9 +230,10 @@ export const syncNow = async (
     return { ok: false, message: 'Sync already in progress' };
   }
 
-  const [outboxItems, settings] = await Promise.all([
+  const [outboxItems, settings, localAuthorizedIps] = await Promise.all([
     targetDb.syncOutbox.orderBy('timestamp').toArray(),
     targetDb.settings.get('app_settings'),
+    targetDb.authorizedIps.toArray(),
   ]);
 
   const mongodbUri = settings?.mongodbUri?.trim() || '';
@@ -224,6 +265,25 @@ export const syncNow = async (
     };
   }
 
+  // On initial sync (`!settings?.lastSyncedAt`), include any local old/seeded IPs so they are registered in MongoDB
+  const effectiveOutbox: SyncOutboxItem[] = [...outboxItems];
+  if (!settings?.lastSyncedAt && localAuthorizedIps.length > 0) {
+    const outboxIds = new Set(outboxItems.map((item) => item.id));
+    for (const ipDoc of localAuthorizedIps) {
+      const key = `authorizedIps:${ipDoc.id}`;
+      if (!outboxIds.has(key)) {
+        effectiveOutbox.push({
+          id: key,
+          collection: 'authorizedIps',
+          documentId: ipDoc.id,
+          action: 'upsert',
+          payload: ipDoc,
+          timestamp: ipDoc.updatedAt || Date.now(),
+        });
+      }
+    }
+  }
+
   isSyncInProgress = true;
   emitStatus({
     state: 'syncing',
@@ -241,7 +301,7 @@ export const syncNow = async (
       body: JSON.stringify({
         mongodbUri: mongodbUri || undefined,
         mongodbDbName,
-        outbox: outboxItems,
+        outbox: effectiveOutbox,
         pullCollections: true,
       }),
     });

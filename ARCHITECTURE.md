@@ -143,7 +143,13 @@ export interface Transaction {
 
 export interface SyncOutboxItem {
   id: string;
-  collection: 'vaults' | 'categories' | 'friends' | 'transactions' | 'settings';
+  collection:
+    | 'vaults'
+    | 'categories'
+    | 'friends'
+    | 'transactions'
+    | 'settings'
+    | 'authorizedIps';
   documentId: string;
   action: 'upsert' | 'delete';
   payload: unknown;
@@ -189,20 +195,24 @@ kanawita/
 │   ├── app/
 │   │   ├── layout.tsx                           # Mobile-first PWA shell (Space Grotesk + JetBrains Mono)
 │   │   ├── manifest.ts                          # Next.js PWA manifest
-│   │   ├── page.tsx                             # Main Single-Page App shell with 4 smooth tabs
+│   │   ├── page.tsx                             # Main Single-Page App shell with 5 smooth tabs + New-IP Password Gate
 │   │   ├── error.tsx / global-error.tsx         # Resilient error boundaries
 │   │   ├── loading.tsx / not-found.tsx          # Skeleton & 404 routes
-│   │   └── api/sync/route.ts                    # Background MongoDB Atlas sync API (GET / POST)
+│   │   ├── api/sync/route.ts                    # Background MongoDB Atlas sync API (GET / POST)
+│   │   ├── api/security/route.ts                # IP & User-Agent detector, password (61854) verifier & MongoDB IP registry
+│   │   └── api/security/route.test.ts           # Vitest suite for /api/security GET/POST check, authorize & revoke
 │   ├── domain/
 │   │   ├── models.ts                            # Core TypeScript interfaces & Tunisian default seeds
 │   │   ├── formatTND.ts                         # TND / DT smart formatter & Speed-Pad keypad engine
 │   │   ├── balanceEngine.ts                     # Unified Total Money & 3 Reference Vaults math
 │   │   ├── influenceEngine.ts                   # Friend Influence CPH, Manual Override & Combo Duos
 │   │   ├── metricsEngine.ts                     # Daily/Monthly burn, Friend Tax, Streak & 28d Heatmap
+│   │   ├── securityEngine.ts                    # Password (61854) check, IP normalization & User-Agent device parser
 │   │   └── domain.test.ts                       # Vitest unit suite for all domain engines
 │   ├── data/
-│   │   ├── db.ts                                # Dexie.js IndexedDB + idempotent starter seed
-│   │   ├── repository.ts                        # Atomic mutations + syncOutbox writer + JSON backup
+│   │   ├── db.ts                                # Dexie.js IndexedDB + idempotent starter seed (including authorizedIps)
+│   │   ├── mongoServer.ts                       # Shared server-side MongoClient connection cache
+│   │   ├── repository.ts                        # Atomic mutations + syncOutbox writer + IP auth/revoke + JSON backup
 │   │   ├── syncEngine.ts                        # Offline-to-Online background MongoDB sync manager
 │   │   └── repository.test.ts                   # Vitest + fake-indexeddb integration test suite
 │   └── components/
@@ -211,6 +221,8 @@ kanawita/
 │       ├── feed/RecentActivitySheet.tsx         # Filterable transactions with 1-tap delete/restore
 │       ├── friends/FriendsInfluenceView.tsx     # Add/remove friends + Good/Bad Influence cards + Combo Duos
 │       ├── metrics/MetricsDashboardView.tsx     # Charts + "Exclude Monthly Fixed Bills" toggle + Heatmap
+│       ├── security/SecurityPasswordGate.tsx    # Lock screen prompting for password (61854) only on unrecognized IPs
+│       ├── security/SecurityDevicesView.tsx     # Security tab showing signup devices, recognized IPs & 1-tap IP deletion
 │       └── settings/SettingsSyncView.tsx        # MongoDB URI config, sync status, JSON backup, reminders
 ```
 
@@ -225,5 +237,11 @@ kanawita/
    - When `syncNow()` completes an in-flight `/api/sync` call, it only deletes outbox entries whose current `timestamp <= sentItem.timestamp`, and `mergeRemoteDataIntoLocal()` skips overwriting any document that still has a pending entry in `syncOutbox` so concurrent local mutations are never clobbered.
 3. **Pure Domain Isolation & DST-Safe Calendar Stepping:**
    - Keeping `src/domain/*` 100% free of browser/React/IndexedDB imports enables deterministic `< 5ms` execution in both `useMemo` hooks and automated Vitest suites, while stepping calendar days via `new Date(year, month, day - offset, 12, 0, 0, 0)` prevents DST boundary skips in the 28-day heatmap.
+4. **Zero-Friction IP-Aware Password Guard (`61854`) & Device Revocation:**
+   - `src/domain/securityEngine.ts` normalizes client IPs (`::1` / `::ffff:127.0.0.1` -> `127.0.0.1`, first hop of `x-forwarded-for`, and `ip_...` document IDs), parses `User-Agent` into human-friendly device names (`iPhone • Mobile Safari`, `Windows PC • Chrome`), and checks recognition against `authorizedIps`.
+   - `src/app/page.tsx` waits for both `authorizedIps` and the initial `/api/security` IP check (`isSecurityReady`) before rendering either `SecurityPasswordGate` or protected app content, preventing premature flashes or stale `localStorage` IP mutations.
+   - The app prompts for password `61854` (`SecurityPasswordGate`) **only** when the active IP is not in `authorizedIps`. Once verified, both historical old IPs and the new IP + device metadata are persisted in local IndexedDB (`db.authorizedIps`), queued in `syncOutbox`, and synced to MongoDB (`authorizedIps` collection via `/api/security` and `/api/sync`). Deleting any IP in `SecurityDevicesView` immediately removes it from local IndexedDB and MongoDB, blocking access from that IP until re-authenticated.
+
+
 
 
